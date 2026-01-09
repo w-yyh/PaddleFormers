@@ -25,6 +25,7 @@ from functools import partial
 from typing import Any, Optional, Tuple, Union
 
 import paddle
+import paddle.distributed as dist
 import paddle.nn.functional as F
 from paddle import Tensor, nn
 from paddle.distributed.fleet import get_hybrid_communicate_group
@@ -38,6 +39,7 @@ from ...nn.embedding import Embedding as GeneralEmbedding
 from ...nn.linear import Linear as GeneralLinear
 from ...nn.lm_head import LMHead as GeneralLMHead
 from ...nn.mlp import MLP
+from ...nn.moe_deepep.moe_factory import QuickAccessMoEFactory
 from ...nn.norm import Norm as GeneralNorm
 from ..cache_utils import Cache, DynamicCache
 from ..masking_utils import (
@@ -377,7 +379,6 @@ class Qwen3VLMoePretrainedModel(PretrainedModel):
         MLP_LAYER_COLWISE = [
             "mlp.up_proj.weight",
             "mlp.gate_proj.weight",
-            "mlp.linear_fc1.weight",
         ]
         FUSE_MLP_LAYER_COLWISE = [
             "up_gate_proj.weight",
@@ -386,15 +387,6 @@ class Qwen3VLMoePretrainedModel(PretrainedModel):
         LAYER_ROWWISE = [
             "self_attn.o_proj.weight",
             "mlp.down_proj.weight",
-            "mlp.linear_fc2.weight",
-        ]
-
-        BIAS_KEYS = [
-            "self_attn.q_proj.bias",
-            "self_attn.k_proj.bias",
-            "self_attn.v_proj.bias",
-            "mlp.linear_fc1.bias",
-            # todo check fc2's bias needs not to be split
         ]
 
         def make_base_actions():
@@ -434,10 +426,6 @@ class Qwen3VLMoePretrainedModel(PretrainedModel):
                 actions.update(
                     {f"{llm_prefix}.layers.{layer_idx}.{k}": partial(fn, is_column=False) for k in LAYER_ROWWISE}
                 )
-                # bias
-                actions.update(
-                    {f"{llm_prefix}.layers.{layer_idx}.{b}": partial(fn, is_column=True) for b in BIAS_KEYS}
-                )
 
             return actions
 
@@ -461,12 +449,22 @@ class Qwen3VLMoePretrainedModel(PretrainedModel):
                 f"model.language_model.layers.$LAYER_ID.post_attention_layernorm.weight -> {llm_prefix}layers.$LAYER_ID.post_attention_layernorm.weight",
                 f"model.language_model.layers.$LAYER_ID.self_attn.o_proj.weight^T -> {llm_prefix}layers.$LAYER_ID.self_attn.o_proj.weight",
                 f"model.language_model.layers.$LAYER_ID.mlp.gate.weight^T -> {llm_prefix}layers.$LAYER_ID.mlp.gate.weight",
-                f"model.language_model.layers.$LAYER_ID.mlp.experts.down_proj -> {llm_prefix}layers.$LAYER_ID.mlp.experts.down_proj",
-                f"model.language_model.layers.$LAYER_ID.mlp.experts.gate_up_proj -> {llm_prefix}layers.$LAYER_ID.mlp.experts.gate_up_proj",
                 f"model.language_model.layers.$LAYER_ID.self_attn.q_norm.weight -> {llm_prefix}layers.$LAYER_ID.self_attn.q_norm.weight",
                 f"model.language_model.layers.$LAYER_ID.self_attn.k_norm.weight -> {llm_prefix}layers.$LAYER_ID.self_attn.k_norm.weight",
             ]
         }
+        # EP
+        if getattr(config, "expert_model_parallel_size", 1) > 1:
+            aoa_config["aoa_statements"] += [
+                f"model.language_model.layers.$LAYER_ID.mlp.experts.down_proj -> {llm_prefix}layers.$LAYER_ID.mlp.experts.$EXPERT_ID.down_proj.weight, axis=0",
+                "model.language_model.layers.$LAYER_ID.mlp.experts.gate_up_proj -> layer_$LAYER_ID_expert_$EXPERT_ID_gate_up_intermediate, axis=0",
+                f"layer_$LAYER_ID_expert_$EXPERT_ID_gate_up_intermediate -> {llm_prefix}layers.$LAYER_ID.mlp.experts.$EXPERT_ID.gate_proj.weight, {llm_prefix}layers.$LAYER_ID.mlp.experts.$EXPERT_ID.up_proj.weight, axis=1",
+            ]
+        else:
+            aoa_config["aoa_statements"] += [
+                f"model.language_model.layers.$LAYER_ID.mlp.experts.down_proj -> {llm_prefix}layers.$LAYER_ID.mlp.experts.down_proj",
+                f"model.language_model.layers.$LAYER_ID.mlp.experts.gate_up_proj -> {llm_prefix}layers.$LAYER_ID.mlp.experts.gate_up_proj",
+            ]
 
         # visual model
         aoa_config["aoa_statements"] += (
@@ -554,12 +552,22 @@ class Qwen3VLMoePretrainedModel(PretrainedModel):
                 f"{llm_prefix}layers.$LAYER_ID.post_attention_layernorm.weight -> model.language_model.layers.$LAYER_ID.post_attention_layernorm.weight",
                 f"{llm_prefix}layers.$LAYER_ID.self_attn.o_proj.weight^T -> model.language_model.layers.$LAYER_ID.self_attn.o_proj.weight",
                 f"{llm_prefix}layers.$LAYER_ID.mlp.gate.weight^T -> model.language_model.layers.$LAYER_ID.mlp.gate.weight",
-                f"{llm_prefix}layers.$LAYER_ID.mlp.experts.down_proj -> model.language_model.layers.$LAYER_ID.mlp.experts.down_proj",
-                f"{llm_prefix}layers.$LAYER_ID.mlp.experts.gate_up_proj -> model.language_model.layers.$LAYER_ID.mlp.experts.gate_up_proj",
                 f"{llm_prefix}layers.$LAYER_ID.self_attn.q_norm.weight -> model.language_model.layers.$LAYER_ID.self_attn.q_norm.weight",
                 f"{llm_prefix}layers.$LAYER_ID.self_attn.k_norm.weight -> model.language_model.layers.$LAYER_ID.self_attn.k_norm.weight",
             ]
         }
+        # EP
+        if getattr(config, "expert_model_parallel_size", 1) > 1:
+            aoa_config["aoa_statements"] += [
+                f"{llm_prefix}layers.$LAYER_ID.mlp.experts.$EXPERT_ID.gate_proj.weight, {llm_prefix}layers.$LAYER_ID.mlp.experts.$EXPERT_ID.up_proj.weight -> layer_$LAYER_ID_expert_$EXPERT_ID_gate_up_intermediate, axis=1",
+                "layer_$LAYER_ID_expert_$EXPERT_ID_gate_up_intermediate -> model.language_model.layers.$LAYER_ID.mlp.experts.gate_up_proj, axis=0",
+                f"{llm_prefix}layers.$LAYER_ID.mlp.experts.$EXPERT_ID.down_proj.weight -> model.language_model.layers.$LAYER_ID.mlp.experts.down_proj, axis=0",
+            ]
+        else:
+            aoa_config["aoa_statements"] += [
+                f"{llm_prefix}layers.$LAYER_ID.mlp.experts.down_proj -> model.language_model.layers.$LAYER_ID.mlp.experts.down_proj",
+                f"{llm_prefix}layers.$LAYER_ID.mlp.experts.gate_up_proj -> model.language_model.layers.$LAYER_ID.mlp.experts.gate_up_proj",
+            ]
 
         # visual model
         aoa_config["aoa_statements"] += (
@@ -1199,8 +1207,8 @@ class Qwen3VLMoeTextAttention(nn.Layer):
 
 
 class Qwen3VLMoeTextMLP(MLP):
-    def __init__(self, config: Qwen3VLMoeTextConfig):
-        super().__init__(config, has_bias=False)
+    def __init__(self, config: Qwen3VLMoeTextConfig, **kwargs):
+        super().__init__(config, has_bias=False, **kwargs)
 
 
 class Qwen3VLMoeTextDecoderLayer(nn.Layer):
@@ -1208,10 +1216,26 @@ class Qwen3VLMoeTextDecoderLayer(nn.Layer):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = Qwen3VLMoeTextAttention(config, layer_idx)
+        try:
+            moe_group = get_hybrid_communicate_group().get_expert_parallel_group()
+        except:
+            moe_group = None
+        expert_model_parallel_size = dist.get_world_size(moe_group) if moe_group is not None else 1
         if (layer_idx not in config.mlp_only_layers) and (
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
-            self.mlp = Qwen3VLMoeTextSparseMoeBlock(config)
+            if expert_model_parallel_size > 1:
+                self.mlp = QuickAccessMoEFactory.create_from_model_name(
+                    pretrained_config=config,
+                    expert_class=Qwen3VLMoeTextMLP,
+                    gate_activation="softmax",
+                    expert_activation="silu",
+                    train_topk_method="greedy",
+                    inference_topk_method="greedy",
+                    transpose_gate_weight=False,
+                )
+            else:
+                self.mlp = Qwen3VLMoeTextSparseMoeBlock(config)
         else:
             self.mlp = Qwen3VLMoeTextMLP(config, fuse_up_gate=config.fuse_attention_ffn)
         self.input_layernorm = GeneralNorm.create(
