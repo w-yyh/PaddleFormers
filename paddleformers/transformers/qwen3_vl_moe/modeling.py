@@ -62,6 +62,7 @@ class Qwen3VLMoeTextExperts(nn.Layer):
         self.hidden_size = config.hidden_size
         self.expert_dim = self.intermediate_size
         self.act_fn = ACT2FN[config.hidden_act]
+        self.config = config
 
         self.gate_up_proj = self.create_parameter(
             shape=[self.num_experts, self.hidden_size, 2 * self.expert_dim],
@@ -75,7 +76,12 @@ class Qwen3VLMoeTextExperts(nn.Layer):
         )
 
     def forward(self, hidden_states, routing_weights, router_indices):
-        batch_size = hidden_states.shape[0]
+        orig_shape = hidden_states.shape
+        num_total_tokens = hidden_states.numel() // self.hidden_size
+        if self.config.sequence_parallel:
+            batch_size = (num_total_tokens * self.config.tensor_model_parallel_size) // self.config.max_sequence_length
+        else:
+            batch_size = hidden_states.shape[0]
         hidden_states = hidden_states.reshape(-1, self.hidden_size)  # (num_tokens, hidden_size)
 
         if self.training:
@@ -94,18 +100,19 @@ class Qwen3VLMoeTextExperts(nn.Layer):
                 out = paddle.matmul(gated_output, self.down_proj[expert_idx])
                 weighted_output = out[0] * routing_weights[token_idx, expert_idx, None]
                 next_states.index_add_(0, token_idx, weighted_output.to(hidden_states.dtype))
-            next_states = next_states.view(batch_size, -1, self.hidden_size)
+            next_states = next_states.reshape(orig_shape)
         else:
             hidden_states = hidden_states.repeat(self.num_experts, 1)
             hidden_states = hidden_states.view(self.num_experts, -1, self.hidden_size)
             gate_up = paddle.bmm(hidden_states, self.gate_up_proj)
             gate, up = gate_up.chunk(2, dim=-1)  # not supported for DTensors
             next_states = paddle.bmm((up * self.act_fn(gate)), self.down_proj)
-            next_states = next_states.reshape(self.num_experts, batch_size, -1, self.hidden_size)
+            next_states = next_states.reshape([self.num_experts, batch_size, -1, self.hidden_size])
             next_states = (
-                next_states * routing_weights.transpose(0, 1).view(self.num_experts, batch_size, -1)[..., None]
+                next_states * routing_weights.transpose(0, 1).view([self.num_experts, batch_size, -1])[..., None]
             )
             next_states = next_states.sum(dim=0)
+            next_states = next_states.reshape(orig_shape)
         return next_states
 
 
@@ -964,12 +971,19 @@ class Qwen3VLMoeTextSparseMoeBlock(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias_attr=False)
         self.experts = Qwen3VLMoeTextExperts(config)
+        self.config = config
 
         # since all the models use norm_topk_prob, we don't need to have a extra check for it
         # self.norm_topk_prob = config.norm_topk_prob
 
     def forward(self, hidden_states: paddle.Tensor) -> paddle.Tensor:
-        batch_size = hidden_states.shape[0]
+        if self.config.sequence_parallel:
+            batch_size = (
+                hidden_states.shape[0] * self.config.tensor_model_parallel_size
+            ) // self.config.max_sequence_length
+            local_q_len = hidden_states.shape[0] // batch_size
+        else:
+            batch_size, local_q_len = hidden_states.shape[0], hidden_states.shape[1]
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
         router_logits = self.gate(hidden_states)
         routing_weights = paddle.nn.functional.softmax(router_logits, dim=-1, dtype=paddle.float)
@@ -977,8 +991,10 @@ class Qwen3VLMoeTextSparseMoeBlock(nn.Module):
         routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
         routing_weights = routing_weights.to(router_logits.dtype)
         router_weights = paddle.zeros_like(router_logits).scatter_(1, router_indices, routing_weights)
-        hidden_states = hidden_states.reshape(batch_size, -1, self.hidden_size)
+        hidden_states = hidden_states.reshape([batch_size, local_q_len, self.hidden_size])
         routed_out = self.experts(hidden_states, router_weights, router_indices)
+        if self.config.sequence_parallel:
+            return routed_out.reshape([-1, self.hidden_size])
         return routed_out
 
 
@@ -1124,9 +1140,11 @@ class Qwen3VLMoeTextAttention(nn.Layer):
     ) -> Tuple[paddle.Tensor, Optional[paddle.Tensor], Optional[Tuple[paddle.Tensor]]]:
         if not self.fuse_attention_qkv:
             if self.sequence_parallel:
-                max_sequence_length = self.config.max_sequence_length
-                bsz = hidden_states.shape[0] * self.config.tensor_model_parallel_size // max_sequence_length
-                q_len = max_sequence_length
+                hidden_states = hidden_states.reshape([-1, self.hidden_size])
+                local_tokens = hidden_states.shape[0]
+                mp_size = self.config.tensor_model_parallel_size
+                bsz = (local_tokens * mp_size) // self.config.max_sequence_length
+                q_len = local_tokens // bsz
             else:
                 bsz, q_len, _ = hidden_states.shape
 
@@ -1137,7 +1155,6 @@ class Qwen3VLMoeTextAttention(nn.Layer):
             query_states = query_states.reshape(bsz, q_len, -1, self.head_dim)
             key_states = key_states.reshape(bsz, q_len, -1, self.head_dim)
             value_states = value_states.reshape(bsz, q_len, -1, self.head_dim)
-
         else:
             mix_layer = self.qkv_proj(hidden_states)
             if self.sequence_parallel:
@@ -1191,8 +1208,10 @@ class Qwen3VLMoeTextAttention(nn.Layer):
             **kwargs,
         )
 
+        local_hidden_dim = self.num_heads * self.head_dim
+
         if self.config.sequence_parallel:
-            attn_output = attn_output.reshape([-1, attn_output.shape[-1]])
+            attn_output = attn_output.reshape([-1, local_hidden_dim])
         attn_output = self.o_proj(attn_output)
         if not output_attentions:
             attn_weights = None
@@ -1508,13 +1527,6 @@ class Qwen3VLMoeTextModel(Qwen3VLMoePretrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if self.config.sequence_parallel:
-            # [bs, seq_len, num_head * head_dim] -> [bs * seq_len, num_head * head_dim]
-            bs, seq_len, hidden_size = inputs_embeds.shape
-            inputs_embeds = paddle.reshape_(inputs_embeds, [bs * seq_len, hidden_size])
-            # [seq_len * bs / n, num_head * head_dim] (n is mp parallelism)
-            inputs_embeds = ScatterOp.apply(inputs_embeds)
-
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = paddle.arange(past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1])
@@ -1532,6 +1544,25 @@ class Qwen3VLMoeTextModel(Qwen3VLMoePretrainedModel):
             # If inputs are not packed (usual 3D positions), do not prepare mask from position_ids
             text_position_ids = None
 
+        if self.config.sequence_parallel:
+            mp_size = self.config.tensor_model_parallel_size
+            mp_rank = paddle.distributed.get_rank() % mp_size
+
+            # [B, S, D] -> [S*B, D] -> [S_local*B, D]
+            inputs_embeds = inputs_embeds.reshape([batch_size * seq_length, -1])
+            inputs_embeds = ScatterOp.apply(inputs_embeds)
+
+            # position_ids: [3, B, S] -> [3, B, S_local]
+            local_seq_len = seq_length // mp_size
+            start_idx = mp_rank * local_seq_len
+            end_idx = start_idx + local_seq_len
+            position_ids = position_ids[:, :, start_idx:end_idx]
+
+            if attn_mask_startend_row_indices is not None:
+                local_seq_len = seq_length // mp_size
+                start_idx = mp_rank * local_seq_len
+                end_idx = start_idx + local_seq_len
+                attn_mask_startend_row_indices = attn_mask_startend_row_indices[:, :, start_idx:end_idx, :]
         # Prepare mask arguments
         mask_kwargs = {
             "config": self.config,
@@ -1602,7 +1633,6 @@ class Qwen3VLMoeTextModel(Qwen3VLMoePretrainedModel):
                     ],
                     **kwargs,
                 )
-
             hidden_states = layer_outputs[0]
             if deepstack_visual_embeds is not None and idx < len(deepstack_visual_embeds):
                 hidden_states = self._deepstack_process(
